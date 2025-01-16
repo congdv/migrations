@@ -10,8 +10,9 @@ import (
 var QueryTimeoutDuration = 5 * time.Second
 
 type Migration struct {
-	db *sql.DB
-	tx *sql.Tx
+	db       *sql.DB
+	tx       *sql.Tx
+	versions []MigrationVersion
 }
 
 type DBMigration struct {
@@ -48,45 +49,6 @@ func (m *MigrationVersion) Forward(ctx context.Context, tx *sql.Tx) error {
 func (m *MigrationVersion) Backward(ctx context.Context, tx *sql.Tx) error {
 	_, err := tx.ExecContext(ctx, m.DownQuery)
 	return err
-}
-
-var migrations = []MigrationVersion{
-	{
-		Name: "create_users",
-		UpQuery: `
-				CREATE EXTENSION IF NOT EXISTS citext;
-				CREATE TABLE IF NOT EXISTS users (
-					id          bigserial PRIMARY KEY,
-					email       citext UNIQUE NOT NULL,
-					username    varchar(255) UNIQUE NOT NULL,
-					password    bytea NOT NULL,
-					created_at  timestamp(0) with time zone NOT NULL DEFAULT NOW(),
-					updated_at  timestamp(0) with time zone NOT NULL DEFAULT NOW()
-				);
-			`,
-		DownQuery: `
-				DROP EXTENSION IF EXISTS "citext" CASCADE;
-				DROP TABLE IF EXISTS users;
-			`,
-	},
-	{
-		Name: "create_users_2",
-		UpQuery: `
-				CREATE EXTENSION IF NOT EXISTS citext;
-				CREATE TABLE IF NOT EXISTS users (
-					id          bigserial PRIMARY KEY,
-					email       citext UNIQUE NOT NULL,
-					username    varchar(255) UNIQUE NOT NULL,
-					password    bytea NOT NULL,
-					created_at  timestamp(0) with time zone NOT NULL DEFAULT NOW(),
-					updated_at  timestamp(0) with time zone NOT NULL DEFAULT NOW()
-				);
-			`,
-		DownQuery: `
-				DROP EXTENSION IF EXISTS "citext" CASCADE;
-				DROP TABLE IF EXISTS users;
-			`,
-	},
 }
 
 func (m *Migration) InitializeMigrationTable(ctx context.Context) error {
@@ -186,7 +148,7 @@ func (migration *Migration) MigrateUp(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		for _, m := range migrations {
+		for _, m := range migration.versions {
 			hasMigrated := false
 			for _, r := range existingMigrations {
 				if r.Name == m.Name {
@@ -225,7 +187,7 @@ func (migration *Migration) MigrateDown(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		for _, m := range migrations {
+		for _, m := range migration.versions {
 			hasSkipped := true
 			for _, r := range existingMigrations {
 				if r.Name == m.Name {
