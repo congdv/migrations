@@ -7,8 +7,11 @@ import (
 	"time"
 )
 
+var QueryTimeoutDuration = 5 * time.Second
+
 type Migration struct {
 	db *sql.DB
+	tx *sql.Tx
 }
 
 type DBMigration struct {
@@ -23,12 +26,27 @@ type MigrationVersion struct {
 	DownQuery string
 }
 
-func (m *MigrationVersion) Forward(ctx context.Context, db *sql.DB) error {
-	_, err := db.ExecContext(ctx, m.UpQuery)
+func withTx(db *sql.DB, ctx context.Context, fn func(*sql.Tx) error) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+
+	if err := fn(tx); err != nil {
+		_ = tx.Rollback()
+		fmt.Printf("[Migrations] Rolling back migrations...\n")
+		return err
+	}
+
+	return tx.Commit()
+}
+
+func (m *MigrationVersion) Forward(ctx context.Context, tx *sql.Tx) error {
+	_, err := tx.ExecContext(ctx, m.UpQuery)
 	return err
 }
-func (m *MigrationVersion) Backward(ctx context.Context, db *sql.DB) error {
-	_, err := db.ExecContext(ctx, m.DownQuery)
+func (m *MigrationVersion) Backward(ctx context.Context, tx *sql.Tx) error {
+	_, err := tx.ExecContext(ctx, m.DownQuery)
 	return err
 }
 
@@ -47,12 +65,12 @@ var migrations = []MigrationVersion{
 				);
 			`,
 		DownQuery: `
-				DROP EXTENSION IF EXISTS citext;
-				DROP TABLE users IF EXISTS
+				DROP EXTENSION IF EXISTS "citext" CASCADE;
+				DROP TABLE IF EXISTS users;
 			`,
 	},
 	{
-		Name: "create_users",
+		Name: "create_users_2",
 		UpQuery: `
 				CREATE EXTENSION IF NOT EXISTS citext;
 				CREATE TABLE IF NOT EXISTS users (
@@ -65,8 +83,8 @@ var migrations = []MigrationVersion{
 				);
 			`,
 		DownQuery: `
-				DROP EXTENSION IF EXISTS citext;
-				DROP TABLE users IF EXISTS
+				DROP EXTENSION IF EXISTS "citext" CASCADE;
+				DROP TABLE IF EXISTS users;
 			`,
 	},
 }
@@ -79,7 +97,7 @@ func (m *Migration) InitializeMigrationTable(ctx context.Context) error {
 		created_at  timestamp(0) with time zone NOT NULL DEFAULT NOW()
 	)
 `
-	_, err := m.db.ExecContext(ctx, query)
+	_, err := m.tx.ExecContext(ctx, query)
 	if err != nil {
 		return err
 	}
@@ -91,7 +109,7 @@ func (m *Migration) DestroyMigrationTable(ctx context.Context) error {
 	query := `
 		DROP TABLE IF EXISTS migrations;
 	`
-	_, err := m.db.ExecContext(ctx, query)
+	_, err := m.tx.ExecContext(ctx, query)
 	if err != nil {
 		return err
 	}
@@ -105,10 +123,11 @@ func (m *Migration) getExitingMigrations(ctx context.Context) ([]DBMigration, er
 	`
 	existingMigrations := []DBMigration{}
 
-	rows, err := m.db.QueryContext(ctx, query)
+	rows, err := m.tx.QueryContext(ctx, query)
 	if err != nil {
 		return nil, err
 	}
+	defer rows.Close()
 
 	for rows.Next() {
 		var m DBMigration
@@ -124,6 +143,14 @@ func (m *Migration) getExitingMigrations(ctx context.Context) ([]DBMigration, er
 		existingMigrations = append(existingMigrations, m)
 	}
 
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	if len(existingMigrations) == 0 {
+		return nil, nil
+	}
+
 	return existingMigrations, nil
 }
 
@@ -133,7 +160,7 @@ func (m *Migration) addMigrationVersion(ctx context.Context, migrationName strin
 		VALUES ($1)
 	`
 
-	_, err := m.db.ExecContext(ctx, query, migrationName)
+	_, err := m.tx.ExecContext(ctx, query, migrationName)
 	return err
 }
 
@@ -143,75 +170,92 @@ func (m *Migration) removeMigrationVersion(ctx context.Context, migrationName st
 		WHERE name = $1
 	`
 
-	_, err := m.db.ExecContext(ctx, query, migrationName)
+	_, err := m.tx.ExecContext(ctx, query, migrationName)
 	return err
 }
 
 func (migration *Migration) MigrateUp(ctx context.Context) error {
-	fmt.Printf("[Migrations] Running up database migrations\n")
-	migration.InitializeMigrationTable(ctx)
-	existingMigrations, err := migration.getExitingMigrations(ctx)
-	if err != nil {
-		return err
-	}
-	for _, m := range migrations {
-		hasMigrated := false
-		for _, r := range existingMigrations {
-			if r.Name == m.Name {
-				hasMigrated = true
-				break
-			}
-		}
-		if hasMigrated {
-			fmt.Printf("[Migrations] Skipping completed migrations [%s]\n", m.Name)
-			continue
-		}
+	ctx, cancel := context.WithTimeout(ctx, QueryTimeoutDuration)
+	defer cancel()
 
-		err := m.Forward(ctx, migration.db)
+	return withTx(migration.db, ctx, func(tx *sql.Tx) error {
+		fmt.Printf("[Migrations] Running up database migrations\n")
+		migration.tx = tx
+		migration.InitializeMigrationTable(ctx)
+		existingMigrations, err := migration.getExitingMigrations(ctx)
 		if err != nil {
-			fmt.Printf("[Migrations] Failed to run migration [%s]\n", m.Name)
 			return err
 		}
-		err = migration.addMigrationVersion(ctx, m.Name)
-		if err != nil {
-			return err
+		for _, m := range migrations {
+			hasMigrated := false
+			for _, r := range existingMigrations {
+				if r.Name == m.Name {
+					hasMigrated = true
+					break
+				}
+			}
+			if hasMigrated {
+				fmt.Printf("[Migrations] Skipping completed migrations [%s]\n", m.Name)
+				continue
+			}
+
+			err := m.Forward(ctx, migration.tx)
+			if err != nil {
+				fmt.Printf("[Migrations] Failed to run migration [%s]\n", m.Name)
+				return err
+			}
+			err = migration.addMigrationVersion(ctx, m.Name)
+			if err != nil {
+				return err
+			}
+			fmt.Printf("Completed migration for [%s]\n", m.Name)
 		}
-		fmt.Printf("Completed migration for [%s]\n", m.Name)
-	}
-	return nil
+		return nil
+	})
 
 }
 
 func (migration *Migration) MigrateDown(ctx context.Context) error {
-	fmt.Printf("[Migrations] Running down database migrations\n")
-	existingMigrations, err := migration.getExitingMigrations(ctx)
-	if err != nil {
-		return err
-	}
-	for _, m := range migrations {
-		hasSkipped := true
-		for _, r := range existingMigrations {
-			if r.Name == m.Name {
-				m.Backward(ctx, migration.db)
-				migration.removeMigrationVersion(ctx, m.Name)
-				fmt.Printf("[Migrations] Cleaned migrations [%s]\n", m.Name)
-				hasSkipped = false
-				break
-			}
+	ctx, cancel := context.WithTimeout(ctx, QueryTimeoutDuration)
+	defer cancel()
+	return withTx(migration.db, ctx, func(tx *sql.Tx) error {
+		fmt.Printf("[Migrations] Running down database migrations\n")
+		migration.tx = tx
+		existingMigrations, err := migration.getExitingMigrations(ctx)
+		if err != nil {
+			return err
 		}
-		if hasSkipped {
-			fmt.Printf("[Migrations] Skipping cleaning migrations [%s]\n", m.Name)
-			continue
-		}
+		for _, m := range migrations {
+			hasSkipped := true
+			for _, r := range existingMigrations {
+				if r.Name == m.Name {
+					if err := m.Backward(ctx, migration.tx); err != nil {
+						return err
+					}
 
-	}
-	existingMigrations, err = migration.getExitingMigrations(ctx)
-	if err != nil {
-		return err
-	}
-	if len(existingMigrations) == 0 {
-		migration.DestroyMigrationTable(ctx)
-	}
-	fmt.Printf("Completed cleaning migrations\n")
-	return nil
+					if err := migration.removeMigrationVersion(ctx, m.Name); err != nil {
+						return err
+					}
+					fmt.Printf("[Migrations] Cleaned migrations [%s]\n", m.Name)
+					hasSkipped = false
+					break
+				}
+			}
+			if hasSkipped {
+				fmt.Printf("[Migrations] Skipping cleaning migrations [%s]\n", m.Name)
+				continue
+			}
+
+		}
+		existingMigrations, err = migration.getExitingMigrations(ctx)
+		if err != nil {
+			return err
+		}
+		if len(existingMigrations) == 0 {
+			migration.DestroyMigrationTable(ctx)
+		}
+		fmt.Printf("Completed destroy migrations\n")
+		return nil
+	})
+
 }

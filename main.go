@@ -19,13 +19,13 @@ func main() {
 	if inputs[0] == "up" {
 		err = migration.MigrateUp(ctx)
 		if err != nil {
-			log.Fatal("Failed to migrate up database: %v", err)
+			log.Fatal("Failed to migrate up database: ", err)
 		}
 	}
 	if inputs[0] == "down" {
 		err = migration.MigrateDown(ctx)
 		if err != nil {
-			log.Fatal("Failed to migrate down database: %v", err)
+			log.Fatal("Failed to migrate down database: ", err)
 		}
 	}
 
