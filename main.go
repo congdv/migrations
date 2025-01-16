@@ -14,15 +14,16 @@ func main() {
 	}
 	defer db.Close()
 	ctx := context.Background()
+	migration := &Migration{db: db}
 
 	if inputs[0] == "up" {
-		err = MigrateUpDatabase(ctx, db)
+		err = migration.MigrateUp(ctx)
 		if err != nil {
 			log.Fatal("Failed to migrate up database: %v", err)
 		}
 	}
 	if inputs[0] == "down" {
-		err = MigrateDownDatabase(ctx, db)
+		err = migration.MigrateDown(ctx)
 		if err != nil {
 			log.Fatal("Failed to migrate down database: %v", err)
 		}

@@ -7,6 +7,10 @@ import (
 	"time"
 )
 
+type Migration struct {
+	db *sql.DB
+}
+
 type DBMigration struct {
 	ID        string
 	Name      string
@@ -14,18 +18,94 @@ type DBMigration struct {
 }
 
 type MigrationVersion struct {
-	Name     string
-	Forward  func(ctx context.Context, db *sql.DB) error
-	Backward func(ctx context.Context, db *sql.DB) error
+	Name      string
+	UpQuery   string
+	DownQuery string
 }
 
-func getExitingMigrations(ctx context.Context, db *sql.DB) ([]DBMigration, error) {
+func (m *MigrationVersion) Forward(ctx context.Context, db *sql.DB) error {
+	_, err := db.ExecContext(ctx, m.UpQuery)
+	return err
+}
+func (m *MigrationVersion) Backward(ctx context.Context, db *sql.DB) error {
+	_, err := db.ExecContext(ctx, m.DownQuery)
+	return err
+}
+
+var migrations = []MigrationVersion{
+	{
+		Name: "create_users",
+		UpQuery: `
+				CREATE EXTENSION IF NOT EXISTS citext;
+				CREATE TABLE IF NOT EXISTS users (
+					id          bigserial PRIMARY KEY,
+					email       citext UNIQUE NOT NULL,
+					username    varchar(255) UNIQUE NOT NULL,
+					password    bytea NOT NULL,
+					created_at  timestamp(0) with time zone NOT NULL DEFAULT NOW(),
+					updated_at  timestamp(0) with time zone NOT NULL DEFAULT NOW()
+				);
+			`,
+		DownQuery: `
+				DROP EXTENSION IF EXISTS citext;
+				DROP TABLE users IF EXISTS
+			`,
+	},
+	{
+		Name: "create_users",
+		UpQuery: `
+				CREATE EXTENSION IF NOT EXISTS citext;
+				CREATE TABLE IF NOT EXISTS users (
+					id          bigserial PRIMARY KEY,
+					email       citext UNIQUE NOT NULL,
+					username    varchar(255) UNIQUE NOT NULL,
+					password    bytea NOT NULL,
+					created_at  timestamp(0) with time zone NOT NULL DEFAULT NOW(),
+					updated_at  timestamp(0) with time zone NOT NULL DEFAULT NOW()
+				);
+			`,
+		DownQuery: `
+				DROP EXTENSION IF EXISTS citext;
+				DROP TABLE users IF EXISTS
+			`,
+	},
+}
+
+func (m *Migration) InitializeMigrationTable(ctx context.Context) error {
+	query := `
+	CREATE TABLE IF NOT EXISTS migrations (
+		id          bigserial PRIMARY KEY,
+		name        TEXT UNIQUE NOT NULL,
+		created_at  timestamp(0) with time zone NOT NULL DEFAULT NOW()
+	)
+`
+	_, err := m.db.ExecContext(ctx, query)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("[Migrations] Migrations table was created\n")
+	return nil
+}
+
+func (m *Migration) DestroyMigrationTable(ctx context.Context) error {
+	query := `
+		DROP TABLE IF EXISTS migrations;
+	`
+	_, err := m.db.ExecContext(ctx, query)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("[Migrations] Migrations table was destroyed\n")
+	return nil
+}
+
+func (m *Migration) getExitingMigrations(ctx context.Context) ([]DBMigration, error) {
 	query := `
 		SELECT * FROM migrations ORDER BY name ASC
 	`
 	existingMigrations := []DBMigration{}
 
-	rows, err := db.QueryContext(ctx, query)
+	rows, err := m.db.QueryContext(ctx, query)
 	if err != nil {
 		return nil, err
 	}
@@ -47,27 +127,33 @@ func getExitingMigrations(ctx context.Context, db *sql.DB) ([]DBMigration, error
 	return existingMigrations, nil
 }
 
-func MigrateUpDatabase(ctx context.Context, db *sql.DB) error {
-	fmt.Printf("[Migrations] Running up database migrations\n")
-
+func (m *Migration) addMigrationVersion(ctx context.Context, migrationName string) error {
 	query := `
-		CREATE TABLE IF NOT EXISTS migrations (
-			id          bigserial PRIMARY KEY,
-			name        TEXT NOT NULL ,
-			created_at  timestamp(0) with time zone NOT NULL DEFAULT NOW()
-		)
+		INSERT INTO migrations(name)
+		VALUES ($1)
 	`
-	_, err := db.ExecContext(ctx, query)
+
+	_, err := m.db.ExecContext(ctx, query, migrationName)
+	return err
+}
+
+func (m *Migration) removeMigrationVersion(ctx context.Context, migrationName string) error {
+	query := `
+		DELETE FROM migrations
+		WHERE name = $1
+	`
+
+	_, err := m.db.ExecContext(ctx, query, migrationName)
+	return err
+}
+
+func (migration *Migration) MigrateUp(ctx context.Context) error {
+	fmt.Printf("[Migrations] Running up database migrations\n")
+	migration.InitializeMigrationTable(ctx)
+	existingMigrations, err := migration.getExitingMigrations(ctx)
 	if err != nil {
 		return err
 	}
-	fmt.Printf("[Migrations] Migrations table was created\n")
-
-	existingMigrations, err := getExitingMigrations(ctx, db)
-	if err != nil {
-		return err
-	}
-
 	for _, m := range migrations {
 		hasMigrated := false
 		for _, r := range existingMigrations {
@@ -81,92 +167,51 @@ func MigrateUpDatabase(ctx context.Context, db *sql.DB) error {
 			continue
 		}
 
-		err := m.Forward(ctx, db)
+		err := m.Forward(ctx, migration.db)
 		if err != nil {
 			fmt.Printf("[Migrations] Failed to run migration [%s]\n", m.Name)
 			return err
 		}
-
-		query = `
-			INSERT INTO migrations(name)
-			VALUES ($1)
-		`
-
-		_, err = db.ExecContext(ctx, query, m.Name)
+		err = migration.addMigrationVersion(ctx, m.Name)
 		if err != nil {
 			return err
 		}
 		fmt.Printf("Completed migration for [%s]\n", m.Name)
 	}
 	return nil
+
 }
 
-func MigrateDownDatabase(ctx context.Context, db *sql.DB) error {
+func (migration *Migration) MigrateDown(ctx context.Context) error {
 	fmt.Printf("[Migrations] Running down database migrations\n")
-	existingMigrations, err := getExitingMigrations(ctx, db)
+	existingMigrations, err := migration.getExitingMigrations(ctx)
 	if err != nil {
 		return err
 	}
-
 	for _, m := range migrations {
-		hasCleaned := false
-		for _, existing := range existingMigrations {
-			if existing.Name == m.Name {
-				m.Backward(ctx, db)
-				hasCleaned = true
+		hasSkipped := true
+		for _, r := range existingMigrations {
+			if r.Name == m.Name {
+				m.Backward(ctx, migration.db)
+				migration.removeMigrationVersion(ctx, m.Name)
+				fmt.Printf("[Migrations] Cleaned migrations [%s]\n", m.Name)
+				hasSkipped = false
+				break
 			}
 		}
-		if !hasCleaned {
-			fmt.Printf("[Migrations] Rollback of migration [%s] is not found", m.Name)
-		} else {
-			fmt.Printf("[Migrations] Rollback of migration [%s] is completed", m.Name)
+		if hasSkipped {
+			fmt.Printf("[Migrations] Skipping cleaning migrations [%s]\n", m.Name)
+			continue
 		}
 
 	}
-
-	existingMigrations, err = getExitingMigrations(ctx, db)
+	existingMigrations, err = migration.getExitingMigrations(ctx)
 	if err != nil {
 		return err
 	}
-
 	if len(existingMigrations) == 0 {
-		query := `
-		DROP TABLE IF EXISTS migrations;
-	`
-		_, err := db.ExecContext(ctx, query)
-		if err != nil {
-			return err
-		}
-		fmt.Printf("[Migrations] Rollback migration table")
+		migration.DestroyMigrationTable(ctx)
 	}
+	fmt.Printf("Completed cleaning migrations\n")
 	return nil
-}
-
-var migrations = []MigrationVersion{
-	{
-		Name: "create_users",
-		Forward: func(ctx context.Context, db *sql.DB) error {
-			query := `
-				CREATE EXTENSION IF NOT EXISTS citext;
-				CREATE TABLE IF NOT EXISTS users (
-					id          bigserial PRIMARY KEY,
-					email       citext UNIQUE NOT NULL,
-					username    varchar(255) UNIQUE NOT NULL,
-					password    bytea NOT NULL,
-					created_at  timestamp(0) with time zone NOT NULL DEFAULT NOW(),
-					updated_at  timestamp(0) with time zone NOT NULL DEFAULT NOW()
-				);
-			`
-			_, err := db.ExecContext(ctx, query)
-			return err
-		},
-		Backward: func(ctx context.Context, db *sql.DB) error {
-			query := `
-				DROP EXTENSION IF EXISTS citext;
-				DROP TABLE users IF EXISTS
-			`
-			_, err := db.ExecContext(ctx, query)
-			return err
-		},
-	},
 }
