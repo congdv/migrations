@@ -4,9 +4,11 @@ import (
 	"context"
 	"log"
 	"os"
+
+	"github.com/congdv/migrations"
 )
 
-var migrations = []MigrationVersion{
+var versions = []migrations.MigrationVersion{
 	{
 		Name: "create_users",
 		UpQuery: `
@@ -53,7 +55,7 @@ func main() {
 	}
 	defer db.Close()
 	ctx := context.Background()
-	migration := &Migration{db: db, versions: migrations}
+	migration := &migrations.Migration{DB: db, Versions: versions}
 
 	if inputs[0] == "up" {
 		err = migration.MigrateUp(ctx)

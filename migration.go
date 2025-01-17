@@ -1,4 +1,4 @@
-package main
+package migrations
 
 import (
 	"context"
@@ -10,9 +10,9 @@ import (
 var QueryTimeoutDuration = 5 * time.Second
 
 type Migration struct {
-	db       *sql.DB
+	DB       *sql.DB
 	tx       *sql.Tx
-	versions []MigrationVersion
+	Versions []MigrationVersion
 }
 
 type DBMigration struct {
@@ -140,7 +140,7 @@ func (migration *Migration) MigrateUp(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(ctx, QueryTimeoutDuration)
 	defer cancel()
 
-	return withTx(migration.db, ctx, func(tx *sql.Tx) error {
+	return withTx(migration.DB, ctx, func(tx *sql.Tx) error {
 		fmt.Printf("[Migrations] Running up database migrations\n")
 		migration.tx = tx
 		migration.InitializeMigrationTable(ctx)
@@ -148,7 +148,7 @@ func (migration *Migration) MigrateUp(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		for _, m := range migration.versions {
+		for _, m := range migration.Versions {
 			hasMigrated := false
 			for _, r := range existingMigrations {
 				if r.Name == m.Name {
@@ -180,14 +180,14 @@ func (migration *Migration) MigrateUp(ctx context.Context) error {
 func (migration *Migration) MigrateDown(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(ctx, QueryTimeoutDuration)
 	defer cancel()
-	return withTx(migration.db, ctx, func(tx *sql.Tx) error {
+	return withTx(migration.DB, ctx, func(tx *sql.Tx) error {
 		fmt.Printf("[Migrations] Running down database migrations\n")
 		migration.tx = tx
 		existingMigrations, err := migration.getExitingMigrations(ctx)
 		if err != nil {
 			return err
 		}
-		for _, m := range migration.versions {
+		for _, m := range migration.Versions {
 			hasSkipped := true
 			for _, r := range existingMigrations {
 				if r.Name == m.Name {
